@@ -6,8 +6,9 @@
   "scripts": {
     "start": "node index.mjs",
     "test": "echo \"No tests configured\" && exit 0"
-  }
-  ,"dependencies": {
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
     "discord.js": "^14.11.0"
   }
 }

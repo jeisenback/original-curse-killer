@@ -1,2 +1,3 @@
 .claude/skills/*/dist/*.exe
 .env
+node_modules/

@@ -1,18 +1,31 @@
 #!/usr/bin/env node
+/**
+ * original-curse-killer — Discord → Claude Code channel bridge (MCP server)
+ *
+ * Architecture: This is NOT a standalone bot. It is an MCP channel server that
+ * Claude Code spawns as a subprocess. Discord messages are forwarded into the
+ * running Claude session as <channel> events; Claude replies via the `reply` tool.
+ *
+ * Start with:
+ *   claude --dangerously-load-development-channels server:discord
+ *
+ * Or, once published to a marketplace:
+ *   claude --channels plugin:discord@marketplace
+ */
+
+import { Server } from '@modelcontextprotocol/sdk/server/index.js'
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { Client, GatewayIntentBits, Partials } from 'discord.js'
 import fs from 'fs'
 import path from 'path'
-import { spawn, execFile } from 'child_process'
-import { promisify } from 'util'
-import { Client, GatewayIntentBits, Partials } from 'discord.js'
 
-const execFileAsync = promisify(execFile)
+// ── .env loader (no extra deps) ────────────────────────────────────────────
 
-// Load `.env` file into process.env if present (simple parser, no extra deps)
 try {
   const envPath = path.resolve(process.cwd(), '.env')
   if (fs.existsSync(envPath)) {
-    const raw = fs.readFileSync(envPath, 'utf8')
-    raw.split(/\r?\n/).forEach(line => {
+    fs.readFileSync(envPath, 'utf8').split(/\r?\n/).forEach(line => {
       const trimmed = line.trim()
       if (!trimmed || trimmed.startsWith('#')) return
       const eq = trimmed.indexOf('=')
@@ -20,226 +33,128 @@ try {
       const key = trimmed.substring(0, eq).trim()
       let val = trimmed.substring(eq + 1)
       if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-        val = val.substring(1, val.length - 1)
+        val = val.slice(1, -1)
       }
       if (!process.env[key]) process.env[key] = val
     })
   }
 } catch (_) {}
 
-const TOKEN = process.env.DISCORD_BOT_TOKEN
-const ALLOWED = (process.env.DISCORD_ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean)
-const NODE_ENV = process.env.NODE_ENV || 'development'
-const TEST_GUILD = process.env.DISCORD_TEST_GUILD_ID || ''
+// ── Config ─────────────────────────────────────────────────────────────────
 
-// Path to the claude CLI binary
-const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude'
-// Default working directory passed to claude (can be overridden per-command)
-const CLAUDE_PROJECT_PATH = process.env.CLAUDE_PROJECT_PATH || 'c:/tools'
-// Session ID to resume. If set, uses --resume <id>; if empty, uses --continue.
-let CLAUDE_SESSION_ID = process.env.CLAUDE_SESSION_ID || ''
+const TOKEN = process.env.DISCORD_BOT_TOKEN
+const ALLOWED = (process.env.DISCORD_ALLOWED_USERS || '')
+  .split(',').map(s => s.trim()).filter(Boolean)
 
 if (!TOKEN) {
-  console.error('Missing DISCORD_BOT_TOKEN. Fill .env or set env var.')
+  process.stderr.write('Missing DISCORD_BOT_TOKEN. Fill .env or set env var.\n')
   process.exit(1)
 }
 
-console.log('Discord→Claude bridge starting...')
-console.log('NODE_ENV=', NODE_ENV)
-console.log('CLAUDE_CLI=', CLAUDE_CLI)
-console.log('CLAUDE_PROJECT_PATH=', CLAUDE_PROJECT_PATH)
-console.log('DISCORD_ALLOWED_USERS=', ALLOWED.length ? ALLOWED.join(',') : '<everyone>')
-
-// Discover gstack skills from .claude/skills/
-const SKILLS_DIR = path.resolve(process.cwd(), '.claude', 'skills')
-let SKILL_NAMES = []
-try {
-  if (fs.existsSync(SKILLS_DIR)) {
-    SKILL_NAMES = fs.readdirSync(SKILLS_DIR, { withFileTypes: true })
-      .filter(d => d.isDirectory())
-      .map(d => d.name.replace(/_/g, '-'))
-  }
-} catch (e) {
-  console.warn('Could not read skills directory:', e && e.message)
+function isAllowed (userId) {
+  return ALLOWED.length === 0 || ALLOWED.includes(String(userId))
 }
-console.log('Skills discovered:', SKILL_NAMES.length ? SKILL_NAMES.join(', ') : '<none>')
+
+// ── Routing tables ─────────────────────────────────────────────────────────
+// Keyed by Discord channel ID; used by the reply tool to send messages back.
+
+const channelCache = new Map()  // channelId  → discord.js Channel
+const messageCache = new Map()  // messageId  → discord.js Message (for threading)
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function isAllowed (userId) {
-  if (ALLOWED.length === 0) return true
-  return ALLOWED.includes(userId) || ALLOWED.includes(String(userId))
-}
-
-/**
- * Run `claude --print <prompt>` safely using spawn (no shell injection).
- * Resolves with the trimmed stdout string.
- */
-function runClaudeCmd (prompt, cwd = CLAUDE_PROJECT_PATH, timeoutMs = 5 * 60 * 1000) {
-  return new Promise((resolve, reject) => {
-    // Attach to the running session if we have one, otherwise grab the most recent
-    const sessionArgs = CLAUDE_SESSION_ID
-      ? ['--resume', CLAUDE_SESSION_ID]
-      : ['--continue']
-    const proc = spawn(CLAUDE_CLI, [...sessionArgs, '--print', prompt], { cwd, timeout: timeoutMs })
-    let stdout = ''
-    let stderr = ''
-    proc.stdout.on('data', chunk => { stdout += chunk })
-    proc.stderr.on('data', chunk => { stderr += chunk })
-    proc.on('error', reject)
-    proc.on('close', code => {
-      if (code === 0) return resolve(stdout.trim())
-      reject(new Error(stderr.trim() || `claude exited with code ${code}`))
-    })
-  })
-}
-
-/** Split a long string into Discord-safe chunks (≤ 1900 chars). */
-function splitMessage (text, maxLen = 1900) {
+/** Split text into Discord-safe chunks at paragraph boundaries when possible. */
+function splitMessage (text, limit = 1900) {
   const chunks = []
-  while (text.length > maxLen) {
-    chunks.push(text.slice(0, maxLen))
-    text = text.slice(maxLen)
+  while (text.length > limit) {
+    let cut = text.lastIndexOf('\n\n', limit)
+    if (cut < limit * 0.5) cut = text.lastIndexOf('\n', limit)
+    if (cut < 1) cut = limit
+    chunks.push(text.slice(0, cut))
+    text = text.slice(cut).replace(/^\n+/, '')
   }
   if (text.length) chunks.push(text)
   return chunks
 }
 
-// Matches: "owner/repo", "github.com/owner/repo", "https://github.com/owner/repo[.git]"
-const GITHUB_RE = /^(?:https?:\/\/github\.com\/)?([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?$/
+// ── MCP server ─────────────────────────────────────────────────────────────
 
-/**
- * If `input` looks like a GitHub repo reference, clone (or pull) it under
- * CLAUDE_PROJECT_PATH and return the local path. Otherwise treat as a local path.
- */
-async function resolveProject (input) {
-  if (!input) return CLAUDE_PROJECT_PATH
-  const m = input.trim().match(GITHUB_RE)
-  if (m) {
-    const [, owner, repo] = m
-    const localPath = path.join(CLAUDE_PROJECT_PATH, repo)
-    const cloneUrl = `https://github.com/${owner}/${repo}.git`
-    if (fs.existsSync(path.join(localPath, '.git'))) {
-      await execFileAsync('git', ['pull', '--ff-only'], { cwd: localPath, timeout: 60_000 })
+const mcp = new Server(
+  { name: 'discord', version: '0.1.0' },
+  {
+    capabilities: {
+      experimental: { 'claude/channel': {} },
+      tools: {},
+    },
+    instructions:
+      'You are connected to Discord via the discord channel bridge. ' +
+      'Inbound messages arrive as <channel source="discord" channel_id="..." ' +
+      'author="..." message_id="...">. ' +
+      'To respond, call the reply tool with the channel_id. ' +
+      'Keep replies concise and chat-appropriate. ' +
+      'You can pass message_id to reply_to for threading.',
+  }
+)
+
+// reply tool — Claude calls this to send a message to Discord
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: 'reply',
+      description: 'Send a message to a Discord channel',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          channel_id: { type: 'string', description: 'The Discord channel ID to send to' },
+          text:       { type: 'string', description: 'Message text (split automatically if > 1900 chars)' },
+          reply_to:   { type: 'string', description: 'Optional message ID to thread the reply onto' },
+        },
+        required: ['channel_id', 'text'],
+      },
+    },
+  ],
+}))
+
+mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (req.params.name !== 'reply') throw new Error(`unknown tool: ${req.params.name}`)
+
+  const { channel_id, text, reply_to } = req.params.arguments ?? {}
+  const ch = channelCache.get(channel_id)
+  if (!ch) {
+    return { content: [{ type: 'text', text: `channel ${channel_id} not in cache` }] }
+  }
+
+  const chunks = splitMessage(text || '')
+  const replyTarget = reply_to ? messageCache.get(reply_to) : null
+
+  for (let i = 0; i < chunks.length; i++) {
+    if (i === 0 && replyTarget) {
+      await replyTarget.reply(chunks[i])
     } else {
-      await execFileAsync('git', ['clone', cloneUrl, localPath], { timeout: 120_000 })
+      await ch.send(chunks[i])
     }
-    return localPath
   }
-  return path.resolve(input)
-}
 
-/**
- * Check whether a message starts with a GitHub repo reference followed by a colon or space.
- * e.g. "owner/repo: explain the auth flow"  →  { target: 'owner/repo', prompt: 'explain...' }
- * Falls back to { target: null, prompt: text } if no match.
- */
-function parseMessageTarget (text) {
-  const m = text.match(/^([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+):?\s+(.+)$/s)
-  if (m) return { target: m[1], prompt: m[2].trim() }
-  return { target: null, prompt: text }
-}
-
-/**
- * Send the Claude response back to Discord.
- * Uses editReply for the first chunk, followUp for the rest.
- */
-async function sendClaudeResponse (output, interaction) {
-  const chunks = splitMessage(output || '*(no response)*')
-  await interaction.editReply(chunks[0])
-  for (let i = 1; i < chunks.length; i++) {
-    await interaction.followUp(chunks[i])
-  }
-}
+  return { content: [{ type: 'text', text: 'sent' }] }
+})
 
 // ── Discord client ─────────────────────────────────────────────────────────
 
-const client = new Client({
+const discord = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.DirectMessages
+    GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.Channel]
+  partials: [Partials.Channel],
 })
 
-client.on('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`)
-
-  // Build slash commands
-  const skillCmds = SKILL_NAMES.map(name => ({
-    name: name.toLowerCase(),
-    description: `Run Claude skill: /${name}`,
-    options: [
-      { name: 'target', description: 'Optional path, URL, or extra context', type: 3, required: false }
-    ]
-  }))
-
-  const claudeCmd = {
-    name: 'claude',
-    description: 'Send a prompt directly to Claude CLI',
-    options: [
-      { name: 'prompt', description: 'The prompt to send', type: 3, required: true },
-      { name: 'project', description: 'Working directory for Claude (defaults to CLAUDE_PROJECT_PATH)', type: 3, required: false }
-    ]
-  }
-
-  const cmds = [...skillCmds, claudeCmd]
-
-  const register = TEST_GUILD
-    ? client.guilds.cache.get(TEST_GUILD)?.commands ?? client.application.commands
-    : client.application.commands
-
-  register.set(cmds)
-    .then(() => console.log(`Registered ${cmds.length} slash command(s)`))
-    .catch(err => console.warn('Failed to register slash commands:', err && err.message))
+discord.once('ready', () => {
+  process.stderr.write(`Discord ready: ${discord.user.tag}\n`)
 })
 
-// ── Slash command handler ──────────────────────────────────────────────────
-
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return
-
-  if (!isAllowed(interaction.user.id)) {
-    return interaction.reply({ content: 'You are not allowed to use this bot.', ephemeral: true })
-  }
-
-  const cmd = interaction.commandName
-
-  let prompt
-  let projectPath = CLAUDE_PROJECT_PATH
-
-  await interaction.deferReply()
-  try {
-    if (cmd === 'claude') {
-      prompt = interaction.options.getString('prompt')
-      const rawProject = interaction.options.getString('project')
-      projectPath = rawProject ? await resolveProject(rawProject) : CLAUDE_PROJECT_PATH
-    } else if (SKILL_NAMES.includes(cmd)) {
-      const target = interaction.options.getString('target') || ''
-      // If target is a GitHub repo, resolve it to a local path and run the skill there
-      if (target && GITHUB_RE.test(target.trim())) {
-        projectPath = await resolveProject(target)
-        prompt = `/${cmd}`
-      } else {
-        prompt = `/${cmd}${target ? ' ' + target : ''}`
-      }
-    } else {
-      return
-    }
-
-    const output = await runClaudeCmd(prompt, projectPath)
-    await sendClaudeResponse(output, interaction)
-  } catch (e) {
-    console.error(`/${cmd} error`, e)
-    await interaction.editReply('Error: ' + (e && e.message ? e.message : String(e)))
-  }
-})
-
-// ── Message handler — treat every message as a Claude CLI prompt ───────────
-
-client.on('messageCreate', async (msg) => {
+discord.on('messageCreate', async (msg) => {
   try {
     if (msg.author?.bot) return
     if (!isAllowed(msg.author.id)) return
@@ -247,72 +162,33 @@ client.on('messageCreate', async (msg) => {
     const text = (msg.content || '').trim()
     if (!text) return
 
-    // !session commands — manage which Claude session the bot talks to
-    if (text.startsWith('!session')) {
-      const parts = text.split(/\s+/)
-      const sub = parts[1]
-      if (!sub || sub === 'show') {
-        return msg.reply(CLAUDE_SESSION_ID
-          ? `Active session: \`${CLAUDE_SESSION_ID}\``
-          : 'No session pinned — using `--continue` (most recent session).')
-      }
-      if (sub === 'set') {
-        const id = parts[2]
-        if (!id) return msg.reply('Usage: `!session set <session-id>`')
-        CLAUDE_SESSION_ID = id
-        return msg.reply(`Session set to \`${id}\`. Bot will now use \`--resume ${id}\`.`)
-      }
-      if (sub === 'clear') {
-        CLAUDE_SESSION_ID = ''
-        return msg.reply('Session cleared. Bot will use `--continue` (most recent session).')
-      }
-      if (sub === 'list') {
-        try {
-          const { stdout } = await execFileAsync(CLAUDE_CLI, ['sessions', 'list'], { timeout: 15_000 })
-          const lines = stdout.trim()
-          const chunks = splitMessage(lines || '(no sessions found)')
-          await msg.reply(chunks[0])
-          for (let i = 1; i < chunks.length; i++) await msg.channel.send(chunks[i])
-        } catch (e) {
-          await msg.reply('Could not list sessions: ' + (e && e.message ? e.message : String(e)))
-        }
-        return
-      }
-      return msg.reply('Session commands: `!session show` · `!session set <id>` · `!session clear` · `!session list`')
-    }
+    // Cache channel and message for reply routing
+    channelCache.set(msg.channelId, msg.channel)
+    messageCache.set(msg.id, msg)
 
-    // Keep Discord's typing indicator alive while Claude thinks
-    const typingInterval = setInterval(() => msg.channel.sendTyping().catch(() => {}), 9000)
+    // Show typing while Claude processes
     msg.channel.sendTyping().catch(() => {})
 
-    try {
-      const output = await runClaudeCmd(text, CLAUDE_PROJECT_PATH)
-      const chunks = splitMessage(output || '*(no response)*')
-      await msg.reply(chunks[0])
-      for (let i = 1; i < chunks.length; i++) {
-        await msg.channel.send(chunks[i])
-      }
-    } finally {
-      clearInterval(typingInterval)
-    }
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: text,
+        meta: {
+          channel_id: msg.channelId,
+          author:     msg.author.username,
+          message_id: msg.id,
+        },
+      },
+    })
   } catch (err) {
-    console.error('messageCreate error', err)
-    try { await msg.reply('Error: ' + (err && err.message ? err.message : String(err))) } catch (_) {}
+    process.stderr.write(`messageCreate error: ${err}\n`)
   }
 })
 
-// ── Error handlers ─────────────────────────────────────────────────────────
-
-process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason))
-process.on('uncaughtException', (err) => console.error('Uncaught exception:', err))
-
 // ── Start ──────────────────────────────────────────────────────────────────
 
-if (NODE_ENV === 'test') {
-  console.log('TEST mode: skipping Discord login.')
-} else {
-  client.login(TOKEN).catch(err => {
-    console.error('Failed to login to Discord:', err)
-    process.exit(1)
-  })
-}
+// Connect to Claude Code over stdio (Claude Code spawns this as a subprocess)
+await mcp.connect(new StdioServerTransport())
+
+// Login to Discord
+await discord.login(TOKEN)
