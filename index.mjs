@@ -5,7 +5,7 @@ import os from 'os'
 import SessionManager from './lib/sessionManager.mjs'
 import { sanitizeTarget } from './lib/targetUtils.mjs'
 import { Client, GatewayIntentBits, Partials, PermissionsBitField, ChannelType } from 'discord.js'
-import { exec } from 'child_process'
+import { exec, spawn } from 'child_process'
 import { promisify } from 'util'
 
 // Load `.env` file into process.env if present (simple parser, no extra deps)
@@ -81,6 +81,45 @@ try {
   console.warn('Could not read skills directory:', e && e.message)
 }
 const execAsync = promisify(exec)
+
+// Path to claude CLI binary — override via CLAUDE_CLI_PATH env var if needed
+const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude'
+
+/**
+ * Invoke `claude --print <prompt>` safely (no shell interpolation).
+ * @param {string} prompt
+ * @param {string|null} cwd  Optional working directory
+ * @param {number} timeoutMs
+ * @returns {Promise<string>} stdout
+ */
+function runClaudeCmd (prompt, cwd = null, timeoutMs = 5 * 60 * 1000) {
+  return new Promise((resolve, reject) => {
+    const args = ['--print', prompt]
+    const opts = { timeout: timeoutMs }
+    if (cwd) opts.cwd = cwd
+    const proc = spawn(CLAUDE_CLI, args, opts)
+    let stdout = ''
+    let stderr = ''
+    proc.stdout.on('data', chunk => { stdout += chunk })
+    proc.stderr.on('data', chunk => { stderr += chunk })
+    proc.on('error', reject)
+    proc.on('close', code => {
+      if (code === 0) return resolve(stdout.trim())
+      reject(new Error(stderr.trim() || `claude exited with code ${code}`))
+    })
+  })
+}
+
+/** Split a string into Discord-safe chunks (≤ 1900 chars each). */
+function splitMessage (text, maxLen = 1900) {
+  const chunks = []
+  while (text.length > maxLen) {
+    chunks.push(text.slice(0, maxLen))
+    text = text.slice(maxLen)
+  }
+  if (text.length) chunks.push(text)
+  return chunks
+}
 
 function isAllowed (userId) {
   if (ALLOWED.length === 0) return true
@@ -207,7 +246,15 @@ client.on('ready', () => {
         name: 'list-pending',
         description: 'List pending sub-agent sessions (helpful to copy id for approve)'
       }
-      const cmds = [...skillCmds, channelCmd, archiveCmd, runSubagentCmd, approveSubagentCmd, listPendingCmd]
+      const claudeCmd = {
+        name: 'claude',
+        description: 'Send a prompt to Claude CLI and get a response',
+        options: [
+          { name: 'prompt', description: 'The prompt to send to Claude', type: 3, required: true },
+          { name: 'project', description: 'Optional working directory / project path for Claude', type: 3, required: false }
+        ]
+      }
+      const cmds = [...skillCmds, channelCmd, archiveCmd, runSubagentCmd, approveSubagentCmd, listPendingCmd, claudeCmd]
       // Register commands: use a test guild if provided for fast propagation
       if (TEST_GUILD) {
         const g = client.guilds.cache.get(TEST_GUILD)
@@ -440,6 +487,36 @@ client.on('interactionCreate', async (interaction) => {
       } catch (e) {
         console.error('approve-subagent error', e)
         await interaction.editReply('Failed to approve sub-agent: ' + (e && e.message ? e.message : String(e)))
+      }
+      return
+    }
+
+    // /claude — send a prompt directly to Claude CLI and return output
+    if (cmd === 'claude') {
+      if (!isAllowed(interaction.user.id)) {
+        return interaction.reply({ content: 'You are not allowed to use the Claude command.', ephemeral: true })
+      }
+      const prompt = interaction.options.getString('prompt')
+      const rawProject = interaction.options.getString('project') || null
+      let projectPath = null
+      if (rawProject) {
+        try {
+          projectPath = sanitizeTarget(rawProject)
+        } catch (err) {
+          return interaction.reply({ content: `Invalid project path: ${err.message}`, ephemeral: true })
+        }
+      }
+      await interaction.deferReply()
+      try {
+        const output = await runClaudeCmd(prompt, projectPath)
+        const chunks = splitMessage(output || '*(empty response)*')
+        await interaction.editReply(chunks[0])
+        for (let i = 1; i < chunks.length; i++) {
+          await interaction.followUp(chunks[i])
+        }
+      } catch (e) {
+        console.error('/claude command error', e)
+        await interaction.editReply('Claude CLI error: ' + (e && e.message ? e.message : String(e)))
       }
       return
     }
