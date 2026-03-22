@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 import fs from 'fs'
 import path from 'path'
-import { spawn } from 'child_process'
+import { spawn, execFile } from 'child_process'
+import { promisify } from 'util'
 import { Client, GatewayIntentBits, Partials } from 'discord.js'
+
+const execFileAsync = promisify(execFile)
 
 // Load `.env` file into process.env if present (simple parser, no extra deps)
 try {
@@ -33,6 +36,8 @@ const TEST_GUILD = process.env.DISCORD_TEST_GUILD_ID || ''
 const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude'
 // Default working directory passed to claude (can be overridden per-command)
 const CLAUDE_PROJECT_PATH = process.env.CLAUDE_PROJECT_PATH || 'c:/tools'
+// Session ID to resume. If set, uses --resume <id>; if empty, uses --continue.
+let CLAUDE_SESSION_ID = process.env.CLAUDE_SESSION_ID || ''
 
 if (!TOKEN) {
   console.error('Missing DISCORD_BOT_TOKEN. Fill .env or set env var.')
@@ -72,7 +77,11 @@ function isAllowed (userId) {
  */
 function runClaudeCmd (prompt, cwd = CLAUDE_PROJECT_PATH, timeoutMs = 5 * 60 * 1000) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(CLAUDE_CLI, ['--print', prompt], { cwd, timeout: timeoutMs })
+    // Attach to the running session if we have one, otherwise grab the most recent
+    const sessionArgs = CLAUDE_SESSION_ID
+      ? ['--resume', CLAUDE_SESSION_ID]
+      : ['--continue']
+    const proc = spawn(CLAUDE_CLI, [...sessionArgs, '--print', prompt], { cwd, timeout: timeoutMs })
     let stdout = ''
     let stderr = ''
     proc.stdout.on('data', chunk => { stdout += chunk })
@@ -94,6 +103,41 @@ function splitMessage (text, maxLen = 1900) {
   }
   if (text.length) chunks.push(text)
   return chunks
+}
+
+// Matches: "owner/repo", "github.com/owner/repo", "https://github.com/owner/repo[.git]"
+const GITHUB_RE = /^(?:https?:\/\/github\.com\/)?([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?$/
+
+/**
+ * If `input` looks like a GitHub repo reference, clone (or pull) it under
+ * CLAUDE_PROJECT_PATH and return the local path. Otherwise treat as a local path.
+ */
+async function resolveProject (input) {
+  if (!input) return CLAUDE_PROJECT_PATH
+  const m = input.trim().match(GITHUB_RE)
+  if (m) {
+    const [, owner, repo] = m
+    const localPath = path.join(CLAUDE_PROJECT_PATH, repo)
+    const cloneUrl = `https://github.com/${owner}/${repo}.git`
+    if (fs.existsSync(path.join(localPath, '.git'))) {
+      await execFileAsync('git', ['pull', '--ff-only'], { cwd: localPath, timeout: 60_000 })
+    } else {
+      await execFileAsync('git', ['clone', cloneUrl, localPath], { timeout: 120_000 })
+    }
+    return localPath
+  }
+  return path.resolve(input)
+}
+
+/**
+ * Check whether a message starts with a GitHub repo reference followed by a colon or space.
+ * e.g. "owner/repo: explain the auth flow"  →  { target: 'owner/repo', prompt: 'explain...' }
+ * Falls back to { target: null, prompt: text } if no match.
+ */
+function parseMessageTarget (text) {
+  const m = text.match(/^([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+):?\s+(.+)$/s)
+  if (m) return { target: m[1], prompt: m[2].trim() }
+  return { target: null, prompt: text }
 }
 
 /**
@@ -166,25 +210,30 @@ client.on('interactionCreate', async (interaction) => {
   let prompt
   let projectPath = CLAUDE_PROJECT_PATH
 
-  if (cmd === 'claude') {
-    prompt = interaction.options.getString('prompt')
-    const rawProject = interaction.options.getString('project')
-    if (rawProject) projectPath = path.resolve(rawProject)
-  } else if (SKILL_NAMES.includes(cmd)) {
-    // Skills are invoked as `/<skill-name> [target]` inside Claude
-    const target = interaction.options.getString('target') || ''
-    prompt = `/${cmd}${target ? ' ' + target : ''}`
-  } else {
-    return
-  }
-
   await interaction.deferReply()
   try {
+    if (cmd === 'claude') {
+      prompt = interaction.options.getString('prompt')
+      const rawProject = interaction.options.getString('project')
+      projectPath = rawProject ? await resolveProject(rawProject) : CLAUDE_PROJECT_PATH
+    } else if (SKILL_NAMES.includes(cmd)) {
+      const target = interaction.options.getString('target') || ''
+      // If target is a GitHub repo, resolve it to a local path and run the skill there
+      if (target && GITHUB_RE.test(target.trim())) {
+        projectPath = await resolveProject(target)
+        prompt = `/${cmd}`
+      } else {
+        prompt = `/${cmd}${target ? ' ' + target : ''}`
+      }
+    } else {
+      return
+    }
+
     const output = await runClaudeCmd(prompt, projectPath)
     await sendClaudeResponse(output, interaction)
   } catch (e) {
     console.error(`/${cmd} error`, e)
-    await interaction.editReply('Claude error: ' + (e && e.message ? e.message : String(e)))
+    await interaction.editReply('Error: ' + (e && e.message ? e.message : String(e)))
   }
 })
 
@@ -197,6 +246,40 @@ client.on('messageCreate', async (msg) => {
 
     const text = (msg.content || '').trim()
     if (!text) return
+
+    // !session commands — manage which Claude session the bot talks to
+    if (text.startsWith('!session')) {
+      const parts = text.split(/\s+/)
+      const sub = parts[1]
+      if (!sub || sub === 'show') {
+        return msg.reply(CLAUDE_SESSION_ID
+          ? `Active session: \`${CLAUDE_SESSION_ID}\``
+          : 'No session pinned — using `--continue` (most recent session).')
+      }
+      if (sub === 'set') {
+        const id = parts[2]
+        if (!id) return msg.reply('Usage: `!session set <session-id>`')
+        CLAUDE_SESSION_ID = id
+        return msg.reply(`Session set to \`${id}\`. Bot will now use \`--resume ${id}\`.`)
+      }
+      if (sub === 'clear') {
+        CLAUDE_SESSION_ID = ''
+        return msg.reply('Session cleared. Bot will use `--continue` (most recent session).')
+      }
+      if (sub === 'list') {
+        try {
+          const { stdout } = await execFileAsync(CLAUDE_CLI, ['sessions', 'list'], { timeout: 15_000 })
+          const lines = stdout.trim()
+          const chunks = splitMessage(lines || '(no sessions found)')
+          await msg.reply(chunks[0])
+          for (let i = 1; i < chunks.length; i++) await msg.channel.send(chunks[i])
+        } catch (e) {
+          await msg.reply('Could not list sessions: ' + (e && e.message ? e.message : String(e)))
+        }
+        return
+      }
+      return msg.reply('Session commands: `!session show` · `!session set <id>` · `!session clear` · `!session list`')
+    }
 
     // Keep Discord's typing indicator alive while Claude thinks
     const typingInterval = setInterval(() => msg.channel.sendTyping().catch(() => {}), 9000)
