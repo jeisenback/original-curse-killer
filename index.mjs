@@ -32,7 +32,7 @@ const TEST_GUILD = process.env.DISCORD_TEST_GUILD_ID || ''
 // Path to the claude CLI binary
 const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude'
 // Default working directory passed to claude (can be overridden per-command)
-const CLAUDE_PROJECT_PATH = process.env.CLAUDE_PROJECT_PATH || process.cwd()
+const CLAUDE_PROJECT_PATH = process.env.CLAUDE_PROJECT_PATH || 'c:/tools'
 
 if (!TOKEN) {
   console.error('Missing DISCORD_BOT_TOKEN. Fill .env or set env var.')
