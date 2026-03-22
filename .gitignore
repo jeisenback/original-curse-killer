@@ -1,1 +1,2 @@
 .claude/skills/*/dist/*.exe
+.env
