@@ -1,0 +1,12 @@
+# List one repo path per line. Edit and save as `.repos` to customize.
+# Paths can be absolute or relative to this repo root.
+
+# Example absolute paths (uncomment and edit if needed):
+# C:/tools/dmforge
+# C:/tools/golden_boy_peanuts
+# C:/tools/non-profit-tool
+
+# Example relative (from this repo):
+../dmforge
+../golden_boy_peanuts
+../non-profit-tool

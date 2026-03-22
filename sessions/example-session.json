@@ -1,0 +1,13 @@
+{
+  "id": "example-session-1",
+  "name": "Example: project-a",
+  "projectPath": "c:/tools/project-a",
+  "owner": "alice",
+  "description": "Workspace for CLAUDE work on project-a",
+  "createdAt": "2026-03-22T00:00:00.000Z",
+  "status": "idle",
+  "metadata": {
+    "claudeModel": "claude-2",
+    "notes": "Use for maintenance tasks"
+  }
+}

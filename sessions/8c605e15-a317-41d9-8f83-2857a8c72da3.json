@@ -1,0 +1,19 @@
+{
+  "id": "8c605e15-a317-41d9-8f83-2857a8c72da3",
+  "name": "subagent-Explore",
+  "projectPath": "",
+  "owner": "tester",
+  "description": "Run a quick codebase exploration (test)",
+  "createdAt": "2026-03-22T19:08:10.254Z",
+  "status": "done",
+  "metadata": {
+    "subagent": {
+      "agentName": "Explore",
+      "prompt": "Run a quick codebase exploration (test)"
+    },
+    "approvedBy": "tester",
+    "approvedAt": "2026-03-22T19:08:10.258Z",
+    "output": "C:\\tools\\original-curse-killer\\sessions\\8c605e15-a317-41d9-8f83-2857a8c72da3-output.txt",
+    "executedAt": "2026-03-22T19:08:10.440Z"
+  }
+}

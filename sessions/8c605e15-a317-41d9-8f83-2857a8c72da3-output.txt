@@ -1,0 +1,8 @@
+--- SUB-AGENT EXECUTION OUTPUT ---
+Agent: Explore
+Prompt: Run a quick codebase exploration (test)
+
+Executing sub-agent: Explore
+Prompt: Run a quick codebase exploration (test)
+Simulated execution complete.
+
