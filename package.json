@@ -1,0 +1,10 @@
+{
+  "name": "channels-discord-bot",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node index.mjs",
+    "test": "echo \"No tests configured\" && exit 0"
+  }
+}

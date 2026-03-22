@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - 'channels/discord-template/**'
+  pull_request:
+    paths:
+      - 'channels/discord-template/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install
+        run: |
+          cd channels/discord-template
+          npm ci || true
+      - name: Lint / Test
+        run: |
+          cd channels/discord-template
+          npm test

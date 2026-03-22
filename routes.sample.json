@@ -1,0 +1,5 @@
+{
+  "default": { "port": 8788, "channelNames": ["dev-general"], "description": "fallback route" },
+  "acme": { "port": 8791, "channelIds": ["123456789012345678"], "channelNames": ["acme-dev"] },
+  "beta": { "port": 8792, "channelIds": ["234567890123456789"], "channelNames": ["beta-team"] }
+}
